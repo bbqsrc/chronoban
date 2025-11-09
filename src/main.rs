@@ -10,7 +10,7 @@ use tokio::fs;
 #[command(about = "Organize files into YYYY-MM directories based on modification time", long_about = None)]
 struct Args {
     /// Directory to organize
-    #[arg(default_value = ".")]
+    #[arg(short = 'd', long = "dir", default_value = ".")]
     path: PathBuf,
 
     /// Perform a dry run without moving files
