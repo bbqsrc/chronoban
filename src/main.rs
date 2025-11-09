@@ -25,14 +25,23 @@ struct Args {
     #[arg(long)]
     use_atime: bool,
 
-    /// Maximum number of concurrent move operations
-    #[arg(short = 'j', long, default_value = "16")]
-    jobs: usize,
+    /// Maximum number of concurrent move operations (defaults to CPU count)
+    #[arg(short = 'j', long)]
+    jobs: Option<usize>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Auto-detect CPU count if jobs not specified
+    if args.jobs.is_none() {
+        args.jobs = Some(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        );
+    }
 
     let path = tokio::fs::canonicalize(&args.path)
         .await
@@ -43,6 +52,7 @@ async fn main() -> Result<()> {
     }
 
     println!("Organizing files in: {}", path.display());
+    println!("Concurrency: {} jobs", args.jobs.unwrap());
     if args.dry_run {
         println!("🔍 DRY RUN MODE - No files will be moved");
     }
@@ -163,7 +173,7 @@ async fn organize_directory(base_path: &Path, args: &Args) -> Result<Stats> {
         tasks.push(task);
 
         // Limit concurrent tasks
-        if tasks.len() >= args.jobs {
+        if tasks.len() >= args.jobs.unwrap() {
             let task = tasks.remove(0);
             match task.await {
                 Ok(Ok(_)) => stats.moved += 1,
