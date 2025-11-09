@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local};
 use clap::Parser;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use tokio::fs;
 
 #[derive(Parser, Debug)]
 #[command(name = "chronoban")]
@@ -17,23 +17,25 @@ struct Args {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Only process files older than N days
+    /// Only process items older than N days
     #[arg(short = 'a', long, default_value = "0")]
     min_age_days: u64,
-
-    /// Recurse into subdirectories (does not recurse into YYYY-MM directories)
-    #[arg(short, long)]
-    recursive: bool,
 
     /// Use access time instead of modification time
     #[arg(long)]
     use_atime: bool,
+
+    /// Maximum number of concurrent move operations
+    #[arg(short = 'j', long, default_value = "16")]
+    jobs: usize,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let path = args.path.canonicalize()
+    let path = tokio::fs::canonicalize(&args.path)
+        .await
         .with_context(|| format!("Failed to access directory: {:?}", args.path))?;
 
     if !path.is_dir() {
@@ -46,7 +48,7 @@ fn main() -> Result<()> {
     }
     println!();
 
-    let stats = organize_directory(&path, &args)?;
+    let stats = organize_directory(&path, &args).await?;
 
     println!("\n📊 Summary:");
     println!("  Files moved: {}", stats.moved);
@@ -62,7 +64,7 @@ struct Stats {
     errors: usize,
 }
 
-fn organize_directory(base_path: &Path, args: &Args) -> Result<Stats> {
+async fn organize_directory(base_path: &Path, args: &Args) -> Result<Stats> {
     let mut stats = Stats {
         moved: 0,
         skipped: 0,
@@ -72,34 +74,23 @@ fn organize_directory(base_path: &Path, args: &Args) -> Result<Stats> {
     let min_age = std::time::Duration::from_secs(args.min_age_days * 24 * 60 * 60);
     let now = SystemTime::now();
 
-    process_directory(base_path, base_path, args, &mut stats, min_age, now)?;
+    // Read directory entries
+    let mut entries = fs::read_dir(base_path)
+        .await
+        .with_context(|| format!("Failed to read directory: {:?}", base_path))?;
 
-    Ok(stats)
-}
+    let mut tasks = Vec::new();
 
-fn process_directory(
-    base_path: &Path,
-    current_path: &Path,
-    args: &Args,
-    stats: &mut Stats,
-    min_age: std::time::Duration,
-    now: SystemTime,
-) -> Result<()> {
-    let entries = fs::read_dir(current_path)
-        .with_context(|| format!("Failed to read directory: {:?}", current_path))?;
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("❌ Error reading entry: {}", e);
-                stats.errors += 1;
-                continue;
-            }
-        };
-
+    while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        let metadata = match entry.metadata() {
+
+        // Skip YYYY-MM directories
+        if is_year_month_dir(&path) {
+            stats.skipped += 1;
+            continue;
+        }
+
+        let metadata = match entry.metadata().await {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("❌ Error reading metadata for {:?}: {}", path, e);
@@ -107,19 +98,6 @@ fn process_directory(
                 continue;
             }
         };
-
-        // Skip if it's already a YYYY-MM directory in the base path
-        if path.is_dir() && is_year_month_dir(&path) && path.parent() == Some(base_path) {
-            stats.skipped += 1;
-            continue;
-        }
-
-        if metadata.is_dir() {
-            if args.recursive && !is_year_month_dir(&path) {
-                process_directory(base_path, &path, args, stats, min_age, now)?;
-            }
-            continue;
-        }
 
         // Get the appropriate timestamp
         let file_time = if args.use_atime {
@@ -149,7 +127,7 @@ fn process_directory(
         let datetime: DateTime<Local> = file_time.into();
         let year_month = format!("{:04}-{:02}", datetime.year(), datetime.month());
 
-        // Create target directory
+        // Create target directory path
         let target_dir = base_path.join(&year_month);
         let target_path = target_dir.join(path.file_name().unwrap());
 
@@ -161,34 +139,62 @@ fn process_directory(
             continue;
         }
 
-        if args.dry_run {
-            println!("📦 Would move: {} -> {}",
-                path.display(), target_path.display());
-            stats.moved += 1;
-        } else {
-            // Create the target directory if it doesn't exist
-            if let Err(e) = fs::create_dir_all(&target_dir) {
-                eprintln!("❌ Error creating directory {:?}: {}", target_dir, e);
-                stats.errors += 1;
-                continue;
-            }
+        let dry_run = args.dry_run;
 
-            // Move the file
-            match fs::rename(&path, &target_path) {
-                Ok(_) => {
-                    println!("✅ Moved: {} -> {}",
-                        path.display(), target_path.display());
-                    stats.moved += 1;
+        // Spawn async task for moving
+        let task = tokio::spawn(async move {
+            if dry_run {
+                println!("📦 Would move: {} -> {}", path.display(), target_path.display());
+                Ok::<_, anyhow::Error>(true)
+            } else {
+                // Create target directory
+                fs::create_dir_all(&target_dir).await
+                    .with_context(|| format!("Failed to create directory: {:?}", target_dir))?;
+
+                // Move the file/directory
+                fs::rename(&path, &target_path).await
+                    .with_context(|| format!("Failed to move {:?} to {:?}", path, target_path))?;
+
+                println!("✅ Moved: {} -> {}", path.display(), target_path.display());
+                Ok(true)
+            }
+        });
+
+        tasks.push(task);
+
+        // Limit concurrent tasks
+        if tasks.len() >= args.jobs {
+            let task = tasks.remove(0);
+            match task.await {
+                Ok(Ok(_)) => stats.moved += 1,
+                Ok(Err(e)) => {
+                    eprintln!("❌ Error: {}", e);
+                    stats.errors += 1;
                 }
                 Err(e) => {
-                    eprintln!("❌ Error moving {:?}: {}", path, e);
+                    eprintln!("❌ Task error: {}", e);
                     stats.errors += 1;
                 }
             }
         }
     }
 
-    Ok(())
+    // Wait for remaining tasks
+    for task in tasks {
+        match task.await {
+            Ok(Ok(_)) => stats.moved += 1,
+            Ok(Err(e)) => {
+                eprintln!("❌ Error: {}", e);
+                stats.errors += 1;
+            }
+            Err(e) => {
+                eprintln!("❌ Task error: {}", e);
+                stats.errors += 1;
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 fn is_year_month_dir(path: &Path) -> bool {
